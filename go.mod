@@ -5,7 +5,7 @@ go 1.24.0
 replace github.com/openshift/api v3.9.0+incompatible => github.com/openshift/api v0.0.0-20230704153349-abb98ff04d03
 
 require (
-	github.com/compose-spec/compose-go/v2 v2.10.0
+	github.com/compose-spec/compose-go/v2 v2.15.0
 	github.com/deckarep/golang-set v1.8.0
 	github.com/fatih/structs v1.1.0
 	github.com/fsouza/go-dockerclient v1.12.3
@@ -16,7 +16,7 @@ require (
 	github.com/novln/docker-parser v1.0.0
 	github.com/openshift/api v3.9.0+incompatible
 	github.com/pkg/errors v0.9.1
-	github.com/sirupsen/logrus v1.9.4
+	github.com/sirupsen/logrus v1.10.1
 	github.com/spf13/cast v1.10.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
@@ -70,7 +70,7 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xhit/go-str2duration/v2 v2.1.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.yaml.in/yaml/v4 v4.0.0-rc.3 // indirect
+	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
 	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
