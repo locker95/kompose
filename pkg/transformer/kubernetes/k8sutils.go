@@ -565,7 +565,21 @@ func (k *Kubernetes) UpdateKubernetesObjects(name string, service kobject.Servic
 		volumesMount = append(volumesMount, TmpVolumesMount...)
 	}
 
-	if pvc != nil && opt.Controller != StatefulStateController {
+	// A StatefulSet owns its claims through volumeClaimTemplates, filled in from
+	// the same pvc slice below, so it must not also get standalone PVC objects or
+	// pod template volumes bound to them. Read that from the objects generated
+	// rather than the requested controller type: restart "no" or "on-failure"
+	// without a controller flag yields a bare Pod or a CronJob even when the
+	// kompose.controller.type label asks for a StatefulSet.
+	isStatefulSet := false
+	for _, obj := range *objects {
+		if _, ok := obj.(*appsv1.StatefulSet); ok {
+			isStatefulSet = true
+			break
+		}
+	}
+
+	if pvc != nil && !isStatefulSet {
 		// Looping on the slice pvc instead of `*objects = append(*objects, pvc...)`
 		// because the type of objects and pvc is different, but when doing append
 		// one element at a time it gets converted to runtime.Object for objects slice
@@ -597,8 +611,17 @@ func (k *Kubernetes) UpdateKubernetesObjects(name string, service kobject.Servic
 		template.Spec.Containers[0].VolumeMounts = append(template.Spec.Containers[0].VolumeMounts, volumesMount...)
 		template.Spec.Containers[0].Stdin = service.Stdin
 		template.Spec.Containers[0].TTY = service.Tty
-		if opt.Controller != StatefulStateController || opt.Volumes == "configMap" {
+
+		if !isStatefulSet || opt.Volumes == "configMap" {
 			template.Spec.Volumes = append(template.Spec.Volumes, volumes...)
+		} else {
+			// Claim-backed volumes arrive through volumeClaimTemplates; the rest
+			// still belong to the pod template.
+			for _, vol := range volumes {
+				if vol.PersistentVolumeClaim == nil {
+					template.Spec.Volumes = append(template.Spec.Volumes, vol)
+				}
+			}
 		}
 		template.Spec.Affinity = ConfigAffinity(service)
 		template.Spec.TopologySpreadConstraints = ConfigTopologySpreadConstraints(service)

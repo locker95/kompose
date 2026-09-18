@@ -1322,3 +1322,204 @@ UNDEFINED_VAR=${MISSING_VAR:-default_value}
 		})
 	}
 }
+
+// pvcServiceConfig returns the service from kubernetes/kompose#2090: a single
+// named volume converted to a PersistentVolumeClaim.
+func pvcServiceConfig(labels map[string]string) kobject.ServiceConfig {
+	return kobject.ServiceConfig{
+		Name:          "postgresql",
+		ContainerName: "postgresql",
+		Image:         "postgres:13-alpine",
+		Replicas:      1,
+		Volumes: []kobject.Volumes{
+			{
+				SvcName:   "postgresql",
+				MountPath: "/var/lib/postgresql/data",
+				Container: "/var/lib/postgresql/data",
+				PVCName:   "pgdata",
+				PVCSize:   "1Gi",
+			},
+		},
+		Labels: labels,
+	}
+}
+
+// TestStatefulSetDoesNotDuplicatePVC covers kubernetes/kompose#2090: a
+// StatefulSet owns its volume through volumeClaimTemplates, so conversion must
+// emit neither a standalone PersistentVolumeClaim, which would have no consumer
+// and stay Pending, nor a pod template volume bound to the same claim.
+func TestStatefulSetDoesNotDuplicatePVC(t *testing.T) {
+	komposeObject := kobject.KomposeObject{
+		ServiceConfigs: map[string]kobject.ServiceConfig{
+			"postgresql": pvcServiceConfig(map[string]string{
+				compose.LabelControllerType: StatefulStateController,
+				"kompose.volume.type":       "persistentVolumeClaim",
+				"kompose.volume.size":       "1Gi",
+			}),
+		},
+	}
+
+	// No --controller flag, so the controller type comes from the
+	// kompose.controller.type label, as in the reported compose file.
+	k := Kubernetes{}
+	objs, err := k.Transform(komposeObject, kobject.ConvertOptions{})
+	if err != nil {
+		t.Fatalf("k.Transform failed: %v", err)
+	}
+
+	var statefulSets []*appsv1.StatefulSet
+	var standalonePVCs []string
+	for _, obj := range objs {
+		switch o := obj.(type) {
+		case *appsv1.StatefulSet:
+			statefulSets = append(statefulSets, o)
+		case *api.PersistentVolumeClaim:
+			standalonePVCs = append(standalonePVCs, o.Name)
+		}
+	}
+
+	if len(standalonePVCs) != 0 {
+		t.Errorf("expected no standalone PersistentVolumeClaim objects for a StatefulSet, got %v", standalonePVCs)
+	}
+	if len(statefulSets) != 1 {
+		t.Fatalf("expected 1 StatefulSet, got %d", len(statefulSets))
+	}
+
+	statefulSet := statefulSets[0]
+	if len(statefulSet.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("expected 1 volumeClaimTemplate, got %d", len(statefulSet.Spec.VolumeClaimTemplates))
+	}
+	claimName := statefulSet.Spec.VolumeClaimTemplates[0].Name
+	if claimName != "pgdata" {
+		t.Errorf("expected volumeClaimTemplate named %q, got %q", "pgdata", claimName)
+	}
+
+	for _, vol := range statefulSet.Spec.Template.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil {
+			t.Errorf("StatefulSet pod template has volume %q backed by claim %q; volumeClaimTemplates already provides it",
+				vol.Name, vol.PersistentVolumeClaim.ClaimName)
+		}
+	}
+
+	// The container must still mount the volume volumeClaimTemplates creates.
+	mounts := statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts
+	var mounted bool
+	for _, mount := range mounts {
+		if mount.Name == claimName {
+			mounted = true
+			if mount.MountPath != "/var/lib/postgresql/data" {
+				t.Errorf("expected %q mounted at %q, got %q", claimName, "/var/lib/postgresql/data", mount.MountPath)
+			}
+		}
+	}
+	if !mounted {
+		t.Errorf("expected container to mount %q, got mounts %v", claimName, mounts)
+	}
+}
+
+// TestPodFromRestartPolicyKeepsStandalonePVC covers the other direction: a
+// restart policy of "no" or "on-failure" yields a bare Pod when no controller
+// flag is given, even when kompose.controller.type asks for a StatefulSet. A
+// Pod has no volumeClaimTemplates, so suppressing the claim there would leave
+// the container mounting a volume that does not exist.
+func TestPodFromRestartPolicyKeepsStandalonePVC(t *testing.T) {
+	service := pvcServiceConfig(map[string]string{
+		compose.LabelControllerType: StatefulStateController,
+		"kompose.volume.type":       "persistentVolumeClaim",
+		"kompose.volume.size":       "1Gi",
+	})
+	service.Restart = "on-failure"
+
+	komposeObject := kobject.KomposeObject{
+		ServiceConfigs: map[string]kobject.ServiceConfig{"postgresql": service},
+	}
+
+	k := Kubernetes{}
+	objs, err := k.Transform(komposeObject, kobject.ConvertOptions{})
+	if err != nil {
+		t.Fatalf("k.Transform failed: %v", err)
+	}
+
+	var pods []*api.Pod
+	var standalonePVCs []string
+	for _, obj := range objs {
+		switch o := obj.(type) {
+		case *api.Pod:
+			pods = append(pods, o)
+		case *api.PersistentVolumeClaim:
+			standalonePVCs = append(standalonePVCs, o.Name)
+		}
+	}
+
+	if len(pods) != 1 {
+		t.Fatalf("expected 1 Pod, got %d", len(pods))
+	}
+	if len(standalonePVCs) != 1 || standalonePVCs[0] != "pgdata" {
+		t.Errorf("expected a standalone PersistentVolumeClaim %q, got %v", "pgdata", standalonePVCs)
+	}
+
+	volumes := map[string]bool{}
+	for _, vol := range pods[0].Spec.Volumes {
+		volumes[vol.Name] = true
+	}
+	for _, mount := range pods[0].Spec.Containers[0].VolumeMounts {
+		if !volumes[mount.Name] {
+			t.Errorf("container mounts %q but the Pod declares no such volume, so the API server rejects it (volumes: %v)",
+				mount.Name, pods[0].Spec.Volumes)
+		}
+	}
+}
+
+// TestStatefulSetKeepsNonClaimVolumes covers the other half of the suppression:
+// only claim-backed volumes move to volumeClaimTemplates, so every other volume
+// must stay in the pod template. A mount with nothing behind it is an invalid
+// manifest.
+func TestStatefulSetKeepsNonClaimVolumes(t *testing.T) {
+	komposeObject := kobject.KomposeObject{
+		ServiceConfigs: map[string]kobject.ServiceConfig{
+			"postgresql": pvcServiceConfig(map[string]string{
+				compose.LabelControllerType: StatefulStateController,
+				"kompose.volume.type":       "emptyDir",
+			}),
+		},
+	}
+
+	k := Kubernetes{}
+	objs, err := k.Transform(komposeObject, kobject.ConvertOptions{})
+	if err != nil {
+		t.Fatalf("k.Transform failed: %v", err)
+	}
+
+	var statefulSet *appsv1.StatefulSet
+	for _, obj := range objs {
+		if o, ok := obj.(*appsv1.StatefulSet); ok {
+			statefulSet = o
+		}
+	}
+	if statefulSet == nil {
+		t.Fatalf("expected a StatefulSet, got %v", objs)
+	}
+	if len(statefulSet.Spec.VolumeClaimTemplates) != 0 {
+		t.Fatalf("an emptyDir volume needs no claim, got %d volumeClaimTemplate(s)",
+			len(statefulSet.Spec.VolumeClaimTemplates))
+	}
+
+	mounts := statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts
+	if len(mounts) == 0 {
+		t.Fatalf("expected the container to mount the volume, got no mounts")
+	}
+
+	backed := map[string]bool{}
+	for _, vol := range statefulSet.Spec.Template.Spec.Volumes {
+		if vol.EmptyDir == nil {
+			t.Errorf("expected volume %q to be an emptyDir, got %+v", vol.Name, vol.VolumeSource)
+		}
+		backed[vol.Name] = true
+	}
+	for _, mount := range mounts {
+		if !backed[mount.Name] {
+			t.Errorf("container mounts %q but the pod template declares no such volume, so the manifest is invalid (volumes: %v)",
+				mount.Name, statefulSet.Spec.Template.Spec.Volumes)
+		}
+	}
+}
